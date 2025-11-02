@@ -101,9 +101,9 @@ class FigurineProPlugin(Star):
 
             for seg in event.message_obj.message:
                 if isinstance(seg, Image):
-                    if seg.url and (img := await self._load_bytes(seg.url)):  # 修复：使用 seg.url
+                    if seg.url and (img := await self._load_bytes(seg.url)):
                         img_bytes_list.append(img)
-                    elif seg.file and (img := await self._load_bytes(seg.file)):  # 修复：使用 seg.file
+                    elif seg.file and (img := await self._load_bytes(seg.file)):
                         img_bytes_list.append(img)
                 elif isinstance(seg, At):
                     at_user_ids.append(str(seg.qq))
@@ -568,10 +568,49 @@ class FigurineProPlugin(Star):
             pass
         return None
 
-    def _is_gemini_api(self, api_url: str) -> bool:
-        """判断是否为 Gemini API"""
-        gemini_domains = ['generativelanguage.googleapis.com', 'googleapis.com']
-        return any(domain in api_url for domain in gemini_domains)
+    async def _is_gemini_api(self, api_url: str) -> bool:
+        """通过检测 /v1/models 端点判断是否为 Gemini API"""
+        if not api_url or not self.iwf:
+            return False
+            
+        try:
+            # 构建 models 端点 URL
+            if api_url.endswith('/v1'):
+                models_url = api_url + '/models'
+            else:
+                models_url = api_url.rstrip('/') + '/v1/models'
+            
+            api_key = await self._get_api_key()
+            if not api_key:
+                return False
+                
+            headers = {"Authorization": f"Bearer {api_key}"}
+            
+            # 发送请求检测
+            async with self.iwf.session.get(
+                models_url, 
+                headers=headers, 
+                proxy=self.iwf.proxy,
+                timeout=10
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    # 检查响应中是否包含 Gemini 相关模型
+                    if 'data' in data:
+                        for model in data['data']:
+                            if 'gemini' in model.get('id', '').lower():
+                                logger.info(f"检测到 Gemini API，模型: {model.get('id')}")
+                                return True
+                    
+                    # 或者检查是否有 Gemini 特定的字段
+                    if any('gemini' in str(value).lower() for value in data.values()):
+                        return True
+                        
+            return False
+            
+        except Exception as e:
+            logger.debug(f"Gemini API 检测失败: {e}")
+            return False
 
     async def _call_gemini_api(self, image_bytes_list: List[bytes], prompt: str) -> bytes | str:
         """使用 Gemini SDK 调用 API"""
@@ -697,8 +736,9 @@ class FigurineProPlugin(Star):
         """统一的 API 调用入口，自动选择调用方式"""
         api_url = self.conf.get("api_url", "")
         
-        # 根据 API URL 自动选择调用方式
-        if self._is_gemini_api(api_url):
+        # 根据 API 检测自动选择调用方式
+        is_gemini = await self._is_gemini_api(api_url)
+        if is_gemini:
             logger.info("使用 Gemini SDK 调用 API")
             return await self._call_gemini_api(image_bytes_list, prompt)
         else:
