@@ -11,9 +11,6 @@ from typing import Dict, Any, List, Optional
 
 import aiohttp
 from PIL import Image as PILImage
-from google import genai
-from google.genai.types import HttpOptions
-from io import BytesIO
 
 from astrbot import logger
 from astrbot.api.event import filter
@@ -148,7 +145,7 @@ class FigurineProPlugin(Star):
         await self._load_user_counts()
         await self._load_group_counts()
         await self._load_user_checkin_data()
-        logger.info("FigurinePro 插件已加载 (支持 Gemini SDK 和 OpenAI 格式)")
+        logger.info("FigurinePro 插件已加载 (Gemini API 格式)")
         if not self.conf.get("api_keys"):
             logger.warning("FigurinePro: 未配置任何 API 密钥，插件可能无法工作")
 
@@ -568,162 +565,109 @@ class FigurineProPlugin(Star):
             pass
         return None
 
-    async def _is_gemini_api(self, api_url: str) -> bool:
-        """通过检测 /v1/models 端点判断是否为 Gemini API"""
-        if not api_url or not self.iwf:
-            return False
-            
-        try:
-            # 构建 models 端点 URL
-            if api_url.endswith('/v1'):
-                models_url = api_url + '/models'
-            else:
-                models_url = api_url.rstrip('/') + '/v1/models'
-            
-            api_key = await self._get_api_key()
-            if not api_key:
-                return False
-                
-            headers = {"Authorization": f"Bearer {api_key}"}
-            
-            # 发送请求检测
-            async with self.iwf.session.get(
-                models_url, 
-                headers=headers, 
-                proxy=self.iwf.proxy,
-                timeout=10
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    # 检查响应中是否包含 Gemini 相关模型
-                    if 'data' in data:
-                        for model in data['data']:
-                            if 'gemini' in model.get('id', '').lower():
-                                logger.info(f"检测到 Gemini API，模型: {model.get('id')}")
-                                return True
-                    
-                    # 或者检查是否有 Gemini 特定的字段
-                    if any('gemini' in str(value).lower() for value in data.values()):
-                        return True
-                        
-            return False
-            
-        except Exception as e:
-            logger.debug(f"Gemini API 检测失败: {e}")
-            return False
-
-    async def _call_gemini_api(self, image_bytes_list: List[bytes], prompt: str) -> bytes | str:
-        """使用 Gemini SDK 调用 API"""
-        api_key = await self._get_api_key()
-        if not api_key: return "无可用的 API Key"
-        
-        try:
-            # 配置 HTTP 选项
-            http_options = HttpOptions()
-            if self.iwf and self.iwf.proxy:
-                http_options.proxy = self.iwf.proxy
-            
-            # 创建 Gemini 客户端
-            client = genai.Client(api_key=api_key, http_options=http_options)
-            
-            # 构建内容
-            contents = []
-            if prompt:
-                contents.append(prompt)
-            
-            # 添加图片
-            for image_bytes in image_bytes_list:
-                pil_image = PILImage.open(BytesIO(image_bytes))
-                contents.append(pil_image)
-            
-            if not contents:
-                return "没有有效的内容发送给 Gemini API"
-
-            # 调用 API
-            response = await asyncio.to_thread(
-                client.models.generate_content,
-                model="models/" + self.conf.get("model", "gemini-2.0-flash-exp"),
-                contents=contents,
-                config=genai.types.GenerateContentConfig(
-                    response_modalities=['Text', 'Image']
-                )
-            )
-
-            # 处理响应
-            if not response or not hasattr(response, 'candidates') or not response.candidates:
-                return "Gemini API 返回空响应"
-
-            candidate = response.candidates[0]
-            
-            # 检查安全限制
-            if hasattr(candidate, 'finish_reason') and candidate.finish_reason.name == 'SAFETY':
-                return "内容因安全策略被阻止"
-
-            if not (hasattr(candidate, 'content') and candidate.content and hasattr(candidate.content, 'parts')):
-                return "Gemini API 返回内容格式错误"
-
-            # 提取生成的图片
-            for part in candidate.content.parts:
-                if hasattr(part, 'inline_data') and part.inline_data and part.inline_data.mime_type.startswith('image/'):
-                    img_data = part.inline_data.data
-                    return img_data
-
-            return "Gemini API 未生成图片"
-
-        except Exception as e:
-            logger.error(f"Gemini API 调用失败: {e}", exc_info=True)
-            return f"Gemini API 调用失败: {str(e)}"
-
-    async def _call_openai_api(self, image_bytes_list: List[bytes], prompt: str) -> bytes | str:
-        """使用 OpenAI 格式调用 API"""
+    async def _call_api(self, image_bytes_list: List[bytes], prompt: str) -> bytes | str:
+        """使用 Gemini API 格式调用 API"""
         api_url = self.conf.get("api_url")
         if not api_url: return "API URL 未配置"
         
         api_key = await self._get_api_key()
         if not api_key: return "无可用的 API Key"
         
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+        # 构建 Gemini 格式的请求
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
 
-        # 构建 content 列表
-        content = [{"type": "text", "text": prompt}]
+        # 构建内容部分
+        contents = []
+        
+        # 添加文本部分
+        if prompt:
+            contents.append({
+                "role": "user",
+                "parts": [{"text": prompt}]
+            })
+        
+        # 添加图片部分
         for image_bytes in image_bytes_list:
             img_b64 = base64.b64encode(image_bytes).decode("utf-8")
-            content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{img_b64}"}})
+            contents.append({
+                "role": "user", 
+                "parts": [{
+                    "inline_data": {
+                        "mime_type": "image/png",
+                        "data": img_b64
+                    }
+                }]
+            })
 
-        # 构建请求载荷
+        # 构建请求载荷 (Gemini 格式)
         payload = {
-            "model": self.conf.get("model", "nano-banana"),
-            "max_tokens": 1500,
-            "stream": False,
-            "messages": [{"role": "user", "content": content}]
+            "contents": contents,
+            "generationConfig": {
+                "maxOutputTokens": 1500,
+            }
         }
+
+        # 构建完整的 API URL
+        model = self.conf.get("model", "gemini-pro")
+        full_api_url = f"{api_url.rstrip('/')}/models/{model}:generateContent"
 
         try:
             if not self.iwf: return "ImageWorkflow 未初始化"
             
-            async with self.iwf.session.post(api_url, json=payload, headers=headers, proxy=self.iwf.proxy,
-                                             timeout=120) as resp:
+            logger.info(f"发送请求到: {full_api_url}")
+            async with self.iwf.session.post(
+                full_api_url, 
+                json=payload, 
+                headers=headers, 
+                proxy=self.iwf.proxy,
+                timeout=120
+            ) as resp:
                 if resp.status != 200:
                     error_text = await resp.text()
                     logger.error(f"API 请求失败: HTTP {resp.status}, 响应: {error_text}")
                     return f"API请求失败 (HTTP {resp.status}): {error_text[:200]}"
                 
                 data = await resp.json()
+                
+                # 检查错误
                 if "error" in data: 
                     return data["error"].get("message", json.dumps(data["error"]))
                 
-                # 提取图片 URL
-                gen_image_url = self._extract_image_url_from_response(data)
-                if not gen_image_url:
-                    error_msg = f"API响应中未找到图片数据: {str(data)[:500]}..."
-                    logger.error(f"API响应中未找到图片数据: {data}")
-                    return error_msg
-                
-                if gen_image_url.startswith("data:image/"):
-                    b64_data = gen_image_url.split(",", 1)[1]
-                    return base64.b64decode(b64_data)
-                else:
-                    return await self.iwf._download_image(gen_image_url) or "下载生成的图片失败"
+                # 提取生成的图片
+                try:
+                    # Gemini API 返回的图片数据在 inline_data 中
+                    if "candidates" in data and data["candidates"]:
+                        candidate = data["candidates"][0]
+                        if "content" in candidate and "parts" in candidate["content"]:
+                            for part in candidate["content"]["parts"]:
+                                if "inlineData" in part:
+                                    img_data = part["inlineData"]["data"]
+                                    return base64.b64decode(img_data)
+                                elif "inline_data" in part:
+                                    img_data = part["inline_data"]["data"]
+                                    return base64.b64decode(img_data)
+                    
+                    # 如果没有找到图片数据，检查是否有文本包含图片 URL
+                    if "candidates" in data and data["candidates"]:
+                        candidate = data["candidates"][0]
+                        if "content" in candidate and "parts" in candidate["content"]:
+                            for part in candidate["content"]["parts"]:
+                                if "text" in part:
+                                    text_content = part["text"]
+                                    # 尝试从文本中提取图片 URL
+                                    url_match = re.search(r'https?://[^\s<>")\]]+', text_content)
+                                    if url_match:
+                                        image_url = url_match.group(0).rstrip(")>,'\"")
+                                        return await self.iwf._download_image(image_url) or "下载生成的图片失败"
+                    
+                    return "API响应中未找到图片数据"
+                    
+                except Exception as e:
+                    logger.error(f"解析 API 响应失败: {e}", exc_info=True)
+                    return f"解析 API 响应失败: {str(e)}"
                     
         except asyncio.TimeoutError:
             logger.error("API 请求超时")
@@ -731,19 +675,6 @@ class FigurineProPlugin(Star):
         except Exception as e:
             logger.error(f"调用 API 时发生未知错误: {e}", exc_info=True)
             return f"发生未知错误: {e}"
-
-    async def _call_api(self, image_bytes_list: List[bytes], prompt: str) -> bytes | str:
-        """统一的 API 调用入口，自动选择调用方式"""
-        api_url = self.conf.get("api_url", "")
-        
-        # 根据 API 检测自动选择调用方式
-        is_gemini = await self._is_gemini_api(api_url)
-        if is_gemini:
-            logger.info("使用 Gemini SDK 调用 API")
-            return await self._call_gemini_api(image_bytes_list, prompt)
-        else:
-            logger.info("使用 OpenAI 格式调用 API")
-            return await self._call_openai_api(image_bytes_list, prompt)
 
     async def terminate(self):
         if self.iwf: 
